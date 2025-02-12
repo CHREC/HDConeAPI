@@ -1,0 +1,7 @@
+# MNIST dataset
+
+### Choir_dat files
+Conversion from original MNIST dataset
+It includes every image, 60000 images for training, 10000 images for testing
+
+Taken from neuralHD repo

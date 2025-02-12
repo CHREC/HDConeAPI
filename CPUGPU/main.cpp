@@ -15,12 +15,11 @@
 // OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT 
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
 // OF SUCH DAMAGE.
+
+#define USE_ONEAPI_FUNCTIONS 0
+
 #include <CL/sycl.hpp>
-#include <oneapi/dpl/random>
-#include <oneapi/dpl/algorithm>
-#include <oneapi/dpl/iterator>
 #include <iostream>
-#include <string>
 #include <random>
 #include <numeric>
 #include <cmath>
@@ -30,18 +29,27 @@
 #include <vector>
 #include <ctime>
 #include <algorithm>
+#include <stdlib.h>     /* srand, rand */
+#include <time.h>       /* time */
+
+#if USE_ONEAPI_FUNCTIONS
 #include <mkl.h>
+#include <oneapi/dpl/random>
 #include <oneapi/mkl/blas.hpp>
 #include "oneapi/mkl/types.hpp"
 #include "oneapi/mkl/vm.hpp"
-#include <stdlib.h>     /* srand, rand */
-#include <time.h>       /* time */
+#endif
+
+
 
 #define TIME (std::chrono::high_resolution_clock::now())
 #define FOR(i,n) for(int i = 0; i < n; i++)
 #define FORX(it,iterable) for(auto &it : iterable)
 
-using namespace sycl;
+#define DATA_PATH PROJECT_PATH_CMAKE "/CPUGPU/data/"
+
+using namespace cl::sycl;
+
 
 using std::cout;
 
@@ -50,8 +58,8 @@ typedef std::vector<std::vector<float>> fmat;
 typedef std::vector<float> fvec;
 typedef std::vector<int> ivec;
 
-typedef sycl::buffer<float> fbuf;
-typedef sycl::buffer<int> ibuf;
+typedef buffer<float,1> fbuf;
+typedef buffer<int,1> ibuf;
 
 typedef std::chrono::high_resolution_clock::time_point timep;
 
@@ -70,7 +78,6 @@ double elapsedTime(timep start, timep end);
 fvec normalize(fvec input);
 Data readData(const char *filename);
 void trainAndTestOneShot();
-void trainAndTestWithRegen();
 void testInferenceBaseline();
 
 //performs matrix mult C = A * trans(B)
@@ -116,9 +123,9 @@ static fvec accuracies, inference_times, train_times, runtimes;
 
 timep tstart, tend;
 
-default_selector d_selector;
+device d_selector(default_selector_v);
 
-static auto e_handler = [](sycl::exception_list e_list) {
+static auto e_handler = [](exception_list e_list) {
   for (std::exception_ptr const &e : e_list) {
     try {
       std::rethrow_exception(e);
@@ -129,53 +136,6 @@ static auto e_handler = [](sycl::exception_list e_list) {
     }
   }
 };
-
-int main(int argc, char **argv){
-	ndims = 2000;
-	if(argc > 1) {
-		ndims = atoi(argv[1]);
-	}
-    std::cout << "Starting inference only: " << ndims << std::endl;
-    trainAndTestWithRegen();
-    testInferenceBaseline();
-    return 0;
-}
-//entry point
-int main2(int argc, char **argv){
-	ndims = 2000;
-	if(argc > 1) {
-		ndims = atoi(argv[1]);
-	}
-    std::cout << "Starting main with dim: " << ndims << std::endl;
-    FOR(i,10) {
-        ndims = 2000;
-        cout << std::endl <<  "TRIAL " << i << ": " << std::endl;
-        //trainAndTestOneShot();
-        trainAndTestWithRegen();
-        FOR(x,15) cout << classesv[x] << "  ";
-        delete basis_bufp; basis_bufp = nullptr;
-        delete classes_bufp; classes_bufp = nullptr;
-        delete q; q = nullptr;
-    }
-    std::cout << "Ending main! YAY!" << std::endl;
-
-    float average_train_time = 0.0;
-    for (auto &x : train_times) average_train_time += x;
-    average_train_time /= (float)10;
-    float average_accuracy = 0.0;
-    for (auto &x : accuracies) average_accuracy += x;
-    average_accuracy /= (float)10;
-    std::cout << std::endl;
-    std::cout << "Train times:" << std::endl;
-    for (auto &x : train_times) cout << x << std::endl;
-    std::cout << "Average train time: " << average_train_time << std::endl;
-    std::cout << std::endl;
-    std::cout << "Accuracies:" << std::endl;
-    for (auto &x : accuracies) cout << x << std::endl;
-    std::cout << "Average accuracy: " << average_accuracy << std::endl;
-
-    return 0;
-}
 
 double elapsedTime(timep start, timep end) {
 	std::chrono::duration<double> time_span = std::chrono::duration_cast<std::chrono::duration<double> >(end - start);
@@ -200,7 +160,7 @@ fvec m2v(fmat in){
 	}
     return out;
 }
-
+#if USE_ONEAPI_FUNCTIONS
 void mmult(fbuf &A, fbuf &B, fbuf &C, int d1, int d2, int d3){
     oneapi::mkl::blas::row_major::gemm( *q,
                                         MNOTRANS,
@@ -217,6 +177,25 @@ void mmult(fbuf &A, fbuf &B, fbuf &C, int d1, int d2, int d3){
                                         C,
                                         d2);
 }
+#else
+void mmult(fbuf &Data_b, fbuf &Basis_b, fbuf &out_buf_b, int ndata, int ndims, int nfeat){
+    range<2> r(ndata,ndims);
+    q->submit([&](auto &h){
+        accessor Data_b_a(Data_b, h, read_only);
+        accessor Basis_b_a(Basis_b, h, read_only);
+        accessor out_buf_a(out_buf_b, h, write_only, no_init);
+        h.parallel_for(r, [=](auto lr){
+            int dt = lr[0];
+            int dim = lr[1];
+            out_buf_a[dt*ndims+dim] = 0.0;
+            for(int f = 0; f < nfeat; f++) {
+                out_buf_a[dt*ndims+dim] += Data_b_a[dt*nfeat+f] * Basis_b_a[dim*nfeat+f];
+            }
+        });
+    });
+}
+#endif
+
 
 Data readData(char *filename) {
     std::ifstream testFile(filename, std::ifstream::binary);
@@ -263,12 +242,22 @@ Data readData(char *filename) {
 void encode(fbuf &data_buf, fbuf &out_buf, int ndata){
     mmult(data_buf, *basis_bufp, out_buf, ndata, ndims, nfeatures);
     q->wait();
+#if USE_ONEAPI_FUNCTIONS
     oneapi::mkl::vm::cos(*q, ndata*ndims, out_buf, out_buf);
+#else
+    auto r = out_buf.get_range();
+    q->submit([&](auto &h){
+        accessor out_a(out_buf, h, read_write);
+        h.parallel_for(r, [=](auto i){
+            out_a[i] = cos(out_a[i]);
+        });
+    });
+#endif
     q->wait();
 }
 
 int cpuFit(fbuf &dataBuf, ivec &labels, fvec &classes) {
-    sycl::host_accessor data(dataBuf);
+    host_accessor data(dataBuf);
     int correct = 0;
     ivec guesses(labels.size(), 0);
     for(int i = 0; i < labels.size(); i++) {
@@ -295,17 +284,6 @@ int cpuFit(fbuf &dataBuf, ivec &labels, fvec &classes) {
             }
         }
     }
-//     for(int i = 0; i < labels.size(); i++) {
-//         if(guesses[i] != labels[i]) {
-//             for(int j = 0; j < ndims; j++) {
-//                 classes[guesses[i] * ndims + j] -= 0.037 * data[i * ndims + j];
-//                 classes[labels[i] * ndims + j] += 0.037 * data[i * ndims + j];
-//             }
-//         }
-//         else {
-//             correct++;
-//         }
-//     }
     return correct;
 }
 
@@ -313,7 +291,9 @@ void fit(fbuf &data, ivec &labels, int &correct){
     ivec indexes(labels.size());
     FOR(i, labels.size()) indexes[i] = i;
     srand(time(0));
-    std::random_shuffle(indexes.begin(), indexes.end());
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::shuffle(indexes.begin(), indexes.end(),g);
 
     int group_size = 1;
     int ndata = labels.size();
@@ -376,55 +356,6 @@ void fit(fbuf &data, ivec &labels, int &correct){
         });
     });
     q->wait();
-//     q->submit([&](auto &h){
-//         accessor classes_pre_norm_a(classes_pre_norm_buf, h, read_only);
-//         accessor class_a(*classes_bufp, h, read_write);
-        
-//         int ndims_ = ndims;
-//         int nclasses_ = nclasses;
-//         int ndata_ = ndata;
-
-//         h.parallel_for(range(nclasses_), [=](auto index){
-//             float sum = 0.0;
-//             int c = index[0];
-//             FOR(i, ndims_){
-//                 float val = classes_pre_norm_a[c * ndims_ + i];
-//                 sum += val * val;
-//             }
-//             float invmag = (float)1.0 / sqrtf(sum);
-//             FOR(i, ndims_){
-//                 class_a[c * ndims_ + i] = classes_pre_norm_a[c * ndims_ + i] * invmag;
-//             }
-//         });
-//     });
-//     q->wait();
-    //maybe calculate accuracy
-}
-
-void fit2(fbuf &data, ivec &labels, int &correct){
-    ivec indexes(labels.size());
-    FOR(i, labels.size()) indexes[i] = i;
-    srand(time(0));
-    std::random_shuffle(indexes.begin(), indexes.end());
-    //X = classes * trans(data)
-    //classes: 1 class per row, dim cols
-    //data: ndata per row, dim cols... trans(data): dim rows, ndata cols
-    //X: nclasses rows, ndata cols
-    //rows of X are now data points dotted with classes
-    //X(row,col) = data[row] closeness to class[col]
-    //guesses = argmax of each row
-    //correct = number of matches between guesses and labels
-    //ALSO for each data point assigned incorrectly update:
-    //adjust correct class add mislabeled data * step size
-    //adjust incorrect class subtract mislabeled data * step size
-    /*
-    q->submit([&](auto &h){
-        accessor label_a(label_buf, h, read_only);
-        h.single_task([=](){
-        });
-    });
-    q->wait();
-    */
 }
 
 void fitOneShot(fbuf &data, ivec &labels, int &correct){
@@ -478,13 +409,10 @@ void fitOneShot(fbuf &data, ivec &labels, int &correct){
     cout << "submit 2" << std::endl;
     q->wait();
     cout << "submit 2 done" << std::endl;
-    // FOR(i, 15){
-    //     cout << classes_pre_norm[i] << " " << classesv[i] << std::endl;
-    // }
-    // cout << std::endl;
 }
 
 double test_times[2];
+#if 0
 void testNN(fbuf &data, ivec &labels, int &correct){
     int ndata = labels.size();
     fvec intermed(ndata * nclasses, 0);
@@ -501,12 +429,19 @@ void testNN(fbuf &data, ivec &labels, int &correct){
         num_items += group_size - (ndata % group_size);
     }
     t1 = TIME;
+
+    int sums = 0;
+
+    {
+        host_accessor b(correct_buf,read_only);
+        for(auto v:b)
+            sums += v;
+    }
+
     q->submit([&](auto &h){
         accessor intermed_a(intermed_buf, h, read_only);
         accessor label_a(label_buf, h, read_only);
         accessor correct_a(correct_buf, h, read_write);
-
-        auto sums = ext::oneapi::reduction(correct_a, ext::oneapi::plus<>());
 
         int nclasses_ = nclasses;
         int ndata_ = ndata;
@@ -531,6 +466,7 @@ void testNN(fbuf &data, ivec &labels, int &correct){
     q->wait();
     test_times[1] += elapsedTime(t1,TIME);
 }
+#endif
 
 void testNN2(fbuf &data, ivec &labels, int &correct){
     int ndata = labels.size();
@@ -620,7 +556,7 @@ ivec rankDims(){
         [&](int i, int j){ return (variances[i] < variances[j]); });
     return sorted_indexes;
 }
-
+#if 0
 void updateClassesAndBasis(ivec &dim_ranks){
     int dim_loss = dim_ranks.size();
     ibuf dim_ranks_buf(dim_ranks);
@@ -655,7 +591,7 @@ void updateClassesAndBasis(ivec &dim_ranks){
     q->wait();
 }
 
-void trainAndTestWithRegen(){
+void trainAndTestWithRegen(const int regen_steps = 0, const int retrain_steps = 0){
     
     cout << "Enter function with dim: " << ndims << std::endl;
     q = new queue(d_selector, e_handler);
@@ -663,12 +599,12 @@ void trainAndTestWithRegen(){
     work_group_size = q->get_device().get_info<info::device::max_work_group_size>();
     cout << work_group_size << std::endl;
     cout << "reading files... " << std::endl;
-	char *testFile = strdup("UCIHAR_test.choir_dat");
+	char *testFile = strdup(DATA_PATH "mnist_test.choir_dat");
 	Data test = readData(testFile);
 	fvec test_data = m2v(test.data);
 	ivec test_labels = test.labels;
 
-	char* trainFile = strdup("UCIHAR_train.choir_dat");
+	char* trainFile = strdup(DATA_PATH "mnist_train.choir_dat");
 	Data train = readData(trainFile);
     fvec train_data = m2v(train.data);
 	ivec train_labels = train.labels;
@@ -686,6 +622,8 @@ void trainAndTestWithRegen(){
     cout << "generate basis: " << nfeatures << " " << ndims << std::endl;
     //generate basis
     tstart = TIME;
+
+#if USE_ONEAPI_FUNCTIONS
     srand (time(NULL));
     int seed = rand();
     q->submit([&](auto &h){
@@ -698,6 +636,17 @@ void trainAndTestWithRegen(){
 			acc[index] = res;
 		});
 	});
+#else
+    {
+        host_accessor acc(*basis_bufp, write_only,no_init);
+        static std::random_device dev;
+        static std::mt19937 rng(dev());
+        static std::normal_distribution<float> gen;
+        for(int i = 0; i < nfeatures*ndims; i++) {
+            acc[i] = gen(rng);
+        }
+    }
+#endif
 	q->wait();
     tend = TIME;
     cout << "generate basis time: " << elapsedTime(tstart, tend) << std::endl;
@@ -713,12 +662,12 @@ void trainAndTestWithRegen(){
     tstart = TIME;
     encode(train_data_buf, train_data_encoded_buf, ndata_train);
     cout << "encode training data: " << elapsedTime(tstart, TIME) << std::endl;
-    tstart = TIME;
+    tstart = TIME;  
     encode(test_data_buf, test_data_encoded_buf, ndata_test);
     cout << "encode testing data: " << elapsedTime(tstart, TIME) << std::endl;
 
-	int regen = 200; // number of regen iterations
-	int interim = 5; // number of iters between regens
+	int regen = regen_steps; // number of regen iterations
+	int interim = retrain_steps; // number of iters between regens
 	double percent_drop = 0.2; // how many dims to regen per regen iter
     
     //ibuf test_label_buf
@@ -734,18 +683,14 @@ void trainAndTestWithRegen(){
         int test_acc = 0, train_acc = 0;
         FOR(j, interim){
             test_acc = 0, train_acc = 0;
-            //hdc.fit(trainOutBuf, trainLabels, trainAcc);
             auto t1 = TIME;
-            // fit(train_data_encoded_buf, train_labels, train_acc);
-            //fit(train_data_encoded_buf, train_labels, train_acc);
-            //sycl::host_accessor encodedAcs(train_data_encoded_buf);
+
             train_acc = cpuFit(train_data_encoded_buf, train_labels, testClasses);
             fit_time += elapsedTime(t1, TIME);
             t1 = TIME;
-            //void test(fbuf &data, ivec &labels, int &correct);
-            //testNN2(test_data_encoded_buf, test_labels, test_acc);
+
             test_time += elapsedTime(t1, TIME);
-            //if train_acc == ndata_train . . .
+
             cout << (float) train_acc / (float) ndata_train << "\n";
             if (test_acc == ndata_test){
                 i = regen;//super break
@@ -780,6 +725,7 @@ void trainAndTestWithRegen(){
     cout << "Inference time: " << inference_time << std::endl;
     cout << "Accuracy: " << accuracy << " " << accuracies[accuracies.size()-1] << std::endl;
 }
+#endif
 
 void trainAndTestOneShot(){
     
@@ -789,12 +735,12 @@ void trainAndTestOneShot(){
     work_group_size = q->get_device().get_info<info::device::max_work_group_size>();
 
     cout << "reading files... " << std::endl;
-	char *testFile = strdup("UCIHAR_test.choir_dat");
+	char *testFile = strdup(DATA_PATH "mnist_test.choir_dat");
 	Data test = readData(testFile);
 	fvec test_data = m2v(test.data);
 	ivec test_labels = test.labels;
 
-	char* trainFile = strdup("UCIHAR_train.choir_dat");
+	char* trainFile = strdup(DATA_PATH "mnist_train.choir_dat");
 	Data train = readData(trainFile);
     fvec train_data = m2v(train.data);
 	ivec train_labels = train.labels;
@@ -814,6 +760,7 @@ void trainAndTestOneShot(){
     cout << "generate basis: " << nfeatures << " " << ndims << std::endl;
     //generate basis
     tstart = TIME;
+#if USE_ONEAPI_FUNCTIONS
     srand (time(NULL));
     int seed = rand();
     q->submit([&](auto &h){
@@ -826,6 +773,17 @@ void trainAndTestOneShot(){
 			acc[index] = res;
 		});
 	});
+#else
+    {
+        host_accessor acc(*basis_bufp, write_only,no_init);
+        static std::random_device dev;
+        static std::mt19937 rng(dev());
+        static std::normal_distribution<float> gen;
+        for(int i = 0; i < nfeatures*ndims; i++) {
+            acc[i] = gen(rng);
+        }
+    }
+#endif
 	q->wait();
     tend = TIME;
     cout << "generate basis time: " << elapsedTime(tstart, tend) << std::endl;
@@ -849,18 +807,16 @@ void trainAndTestOneShot(){
     cout << train_data_encoded[0] << std::endl;
     cout << basisv[0] << std::endl;
 
-    //ibuf test_label_buf
+
     double fit_time = 0;
     double test_time = 0;
     int test_acc = 0, train_acc = 0, pre_train_acc = 0;
-    //hdc.fit(trainOutBuf, trainLabels, trainAcc);
+
     tstart = TIME;
     fitOneShot(train_data_encoded_buf, train_labels, train_acc);
     fit_time += elapsedTime(tstart, TIME);
     cout << "training time: " << fit_time << std::endl;
-    // cout << "correct guesses pre: " << pre_train_acc << std::endl;
-    // cout << "correct guesses: " << train_acc << std::endl;
-    // cout << "training acc: " << ((double) train_acc) / ((double)(ndata_train)) << std::endl;
+
 
     tstart = TIME;
     testNN2(test_data_encoded_buf, test_labels, test_acc);
@@ -868,14 +824,12 @@ void trainAndTestOneShot(){
     cout << "testing time: " << inference_time << std::endl;
     cout << "correct guesses: " << test_acc << std::endl;
     cout << "testing acc: " << ((double) test_acc) / ((double)(ndata_test)) << std::endl;
-    // FOR(i, classesv.size()){
-    //     cout << classesv[i] << std::endl;
-    //     if(i > 50) break;
-    // }
+
     train_times.push_back((float)fit_time + (float)encode_training_time);
     accuracies.push_back((float)((double) test_acc) / ((double)(ndata_test)));
 }
 
+#if 0
 void testInferenceBaseline(){
     
     cout << "Enter function with dim: " << ndims << std::endl;
@@ -884,12 +838,12 @@ void testInferenceBaseline(){
     work_group_size = q->get_device().get_info<info::device::max_work_group_size>();
 
     cout << "reading files... " << std::endl;
-	char *testFile = strdup("UCIHAR_test.choir_dat");
+	char *testFile = strdup(DATA_PATH "mnist_test.choir_dat");
 	Data test = readData(testFile);
 	fvec test_data = m2v(test.data);
 	ivec test_labels = test.labels;
 
-	char* trainFile = strdup("UCIHAR_train.choir_dat");
+	char* trainFile = strdup(DATA_PATH "mnist_train.choir_dat");
 	Data train = readData(trainFile);
     fvec train_data = m2v(train.data);
 	ivec train_labels = train.labels;
@@ -925,27 +879,7 @@ void testInferenceBaseline(){
     tend = TIME;
     
     int ndata_train = train_labels.size();
-    // fvec train_data_encoded(ndata_train * ndims, 0);
-    // fbuf train_data_buf(train_data);
-    // fbuf train_data_encoded_buf(train_data_encoded);
     int ndata_test = test_labels.size();
-    // fvec test_data_encoded(ndata_test * ndims, 0);
-    // fbuf test_data_buf(test_data);
-    // fbuf test_data_encoded_buf(test_data_encoded);
-    // tstart = TIME;
-    // encode(train_data_buf, train_data_encoded_buf, ndata_train);
-    // double encode_training_time = elapsedTime(tstart, TIME);
-    // cout << "encode training data: " << encode_training_time << std::endl;
-    // tstart = TIME;
-    // encode(test_data_buf, test_data_encoded_buf, ndata_test);
-    // cout << "encode testing data: " << elapsedTime(tstart, TIME) << std::endl;
-
-    // cout << "ndata_train: " << ndata_train << std::endl;
-    // cout << "ndata_test: " << ndata_test << std::endl;
-    
-    // tstart = TIME;
-    // testNN2(test_data_encoded_buf, test_labels, test_acc);
-    // double inference_time = elapsedTime(tstart, TIME);
 
     std::vector<double> times(10);
     FOR(time_i, times.size()){
@@ -970,4 +904,16 @@ void testInferenceBaseline(){
     double average_time = 0;
     FORX(x,times) average_time += x/10.0;
     cout << "average: " << average_time << std::endl;
+}
+#endif
+int main(int argc, char **argv){
+	ndims = 2000;
+	if(argc > 1) {
+		ndims = atoi(argv[1]);
+	}
+    std::cout << "Starting inference only: " << ndims << std::endl;
+    //trainAndTestWithRegen();
+    trainAndTestOneShot();
+    //testInferenceBaseline();
+    return 0;
 }
